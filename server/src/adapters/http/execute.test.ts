@@ -58,6 +58,7 @@ describe("http adapter execute", () => {
       "x-request-source": "paperclip",
       authorization: `Bearer ${controllerToken}`,
     });
+    expect(request.redirect).toBe("error");
     expect(request.body).not.toContain(controllerToken);
     expect(result.summary).not.toContain(controllerToken);
   });

@@ -54,6 +54,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       method,
       headers,
       body: JSON.stringify(body),
+      ...(controllerToken ? { redirect: "error" as const } : {}),
       ...(timer ? { signal: controller.signal } : {}),
     });
 
