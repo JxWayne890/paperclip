@@ -1,6 +1,39 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "../types.js";
 import { asString, asNumber, parseObject } from "../utils.js";
 
+const SENSITIVE_HEADER_NAME_RE =
+  /(authorization|cookie|api[-_]?key|token|secret|password|passwd|credential|jwt|private[-_]?key)/i;
+const INVALID_HEADER_VALUE_CHAR_RE = /[\u0000-\u001f\u007f]/;
+
+class SafeHttpAdapterError extends Error {}
+
+function buildRequestHeaders(
+  configuredHeaders: unknown,
+  controllerToken: string,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+  };
+
+  for (const [name, value] of Object.entries(parseObject(configuredHeaders))) {
+    if (SENSITIVE_HEADER_NAME_RE.test(name)) {
+      throw new SafeHttpAdapterError(
+        "HTTP adapter config.headers cannot include authorization, cookie, API key, token, secret, password, credential, or JWT headers; use controllerToken for bearer authentication.",
+      );
+    }
+    headers[name] = String(value);
+  }
+
+  if (controllerToken) {
+    if (INVALID_HEADER_VALUE_CHAR_RE.test(controllerToken)) {
+      throw new SafeHttpAdapterError("HTTP adapter controllerToken contains invalid header characters.");
+    }
+    headers.authorization = `Bearer ${controllerToken}`;
+  }
+
+  return headers;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { config, runId, agent, context } = ctx;
   const url = asString(config.url, "");
@@ -8,7 +41,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const method = asString(config.method, "POST");
   const timeoutMs = asNumber(config.timeoutMs, 0);
-  const headers = parseObject(config.headers) as Record<string, string>;
+  const controllerToken = asString(config.controllerToken, "").trim();
+  const headers = buildRequestHeaders(config.headers, controllerToken);
   const payloadTemplate = parseObject(config.payloadTemplate);
   const body = { ...payloadTemplate, agentId: agent.id, runId, context };
 
@@ -18,16 +52,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
     const res = await fetch(url, {
       method,
-      headers: {
-        "content-type": "application/json",
-        ...headers,
-      },
+      headers,
       body: JSON.stringify(body),
       ...(timer ? { signal: controller.signal } : {}),
     });
 
     if (!res.ok) {
-      throw new Error(`HTTP invoke failed with status ${res.status}`);
+      throw new SafeHttpAdapterError(`HTTP invoke failed with status ${res.status}`);
     }
 
     return {
@@ -46,7 +77,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorCode: "timeout",
       };
     }
-    throw err;
+    if (err instanceof SafeHttpAdapterError) throw err;
+    throw new SafeHttpAdapterError("HTTP invoke failed before receiving a response");
   } finally {
     if (timer) clearTimeout(timer);
   }
