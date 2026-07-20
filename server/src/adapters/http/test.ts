@@ -4,6 +4,9 @@ import type {
   AdapterEnvironmentTestResult,
 } from "../types.js";
 import { asString, parseObject } from "../utils.js";
+import { buildRequestHeaders } from "./execute.js";
+
+const CONTROLLER_PROBE_PROTOCOL = "amc-role-controller-probe/v1";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -23,6 +26,7 @@ export async function testEnvironment(
   const config = parseObject(ctx.config);
   const urlValue = asString(config.url, "");
   const method = normalizeMethod(asString(config.method, "POST"));
+  const controllerToken = asString(config.controllerToken, "").trim();
 
   if (!urlValue) {
     checks.push({
@@ -73,15 +77,56 @@ export async function testEnvironment(
     message: `Configured method: ${method}`,
   });
 
+  if (controllerToken && method !== "POST") {
+    checks.push({
+      code: "http_controller_probe_method_invalid",
+      level: "error",
+      message: "Authenticated controller adapters require the POST method.",
+    });
+    return {
+      adapterType: ctx.adapterType,
+      status: summarizeStatus(checks),
+      checks,
+      testedAt: new Date().toISOString(),
+    };
+  }
+
   if (url && (url.protocol === "http:" || url.protocol === "https:")) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3000);
     try {
-      const response = await fetch(url, {
-        method: "HEAD",
-        signal: controller.signal,
-      });
-      if (!response.ok && response.status !== 405 && response.status !== 501) {
+      const authenticatedProbe = controllerToken.length > 0;
+      const response = await fetch(url, authenticatedProbe
+        ? {
+            method: "POST",
+            headers: buildRequestHeaders(config.headers, controllerToken),
+            body: JSON.stringify({ controllerProtocol: CONTROLLER_PROBE_PROTOCOL }),
+            redirect: "error",
+            signal: controller.signal,
+          }
+        : {
+            method: "HEAD",
+            signal: controller.signal,
+          });
+      if (authenticatedProbe) {
+        if (
+          response.status !== 204
+          || response.headers.get("x-amc-controller-probe") !== CONTROLLER_PROBE_PROTOCOL
+        ) {
+          checks.push({
+            code: "http_controller_probe_failed",
+            level: "error",
+            message: "Authenticated controller probe was not acknowledged.",
+            hint: "Verify the encrypted controllerToken, exact internal URL, and controller protocol.",
+          });
+        } else {
+          checks.push({
+            code: "http_controller_probe_ok",
+            level: "info",
+            message: "Encrypted controller authentication and protocol probe succeeded.",
+          });
+        }
+      } else if (!response.ok && response.status !== 405 && response.status !== 501) {
         checks.push({
           code: "http_endpoint_probe_unexpected_status",
           level: "warn",
@@ -97,10 +142,14 @@ export async function testEnvironment(
       }
     } catch (err) {
       checks.push({
-        code: "http_endpoint_probe_failed",
-        level: "warn",
-        message: err instanceof Error ? err.message : "Endpoint probe failed",
-        hint: "This may be expected in restricted networks; verify connectivity when invoking runs.",
+        code: controllerToken ? "http_controller_probe_failed" : "http_endpoint_probe_failed",
+        level: controllerToken ? "error" : "warn",
+        message: controllerToken
+          ? "Authenticated controller probe failed before acknowledgement."
+          : err instanceof Error ? err.message : "Endpoint probe failed",
+        hint: controllerToken
+          ? "Verify the encrypted controllerToken, exact internal URL, and controller availability."
+          : "This may be expected in restricted networks; verify connectivity when invoking runs.",
       });
     } finally {
       clearTimeout(timeout);

@@ -7,7 +7,7 @@ const INVALID_HEADER_VALUE_CHAR_RE = /[\u0000-\u001f\u007f]/;
 
 class SafeHttpAdapterError extends Error {}
 
-function buildRequestHeaders(
+export function buildRequestHeaders(
   configuredHeaders: unknown,
   controllerToken: string,
 ): Record<string, string> {
