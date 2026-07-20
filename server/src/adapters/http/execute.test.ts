@@ -115,7 +115,7 @@ describe("http adapter execute", () => {
 
   it("proves the resolved controller token with an authenticated no-work POST", async () => {
     const controllerToken = "resolved-controller-probe-secret";
-    const fetchMock = vi.fn(async () => ({
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) => ({
       ok: true,
       status: 204,
       headers: new Headers({
