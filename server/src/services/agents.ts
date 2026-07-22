@@ -312,17 +312,28 @@ export function agentService(db: Db) {
   }
 
   async function getById(id: string) {
-    const row = await db
-      .select()
-      .from(agents)
-      .where(eq(agents.id, id))
-      .then((rows) => rows[0] ?? null);
+    const row = await getStoredById(id);
     if (!row) return null;
     const [companyRows, hydrated] = await Promise.all([
       listCompanyAgentRows(row.companyId),
       hydrateAgentSpend([row]).then((rows) => rows[0]!),
     ]);
     return normalizeAgentRow(hydrated, companyRows);
+  }
+
+  /**
+   * Returns the database representation without presentation-only hydration.
+   *
+   * `updateAgent` uses this for its optimistic snapshot.  `getById` adds
+   * derived spend, normalized permissions, URL keys, and org health; those
+   * fields are intentionally not part of a persisted-row CAS comparison.
+   */
+  async function getStoredById(id: string) {
+    return db
+      .select()
+      .from(agents)
+      .where(eq(agents.id, id))
+      .then((rows) => rows[0] ?? null);
   }
 
   async function requireGetById(id: string) {
@@ -395,7 +406,10 @@ export function agentService(db: Db) {
     data: Partial<typeof agents.$inferInsert>,
     options?: UpdateAgentOptions,
   ) {
-    const existing = await getById(id);
+    // Keep the pre-lock snapshot in the exact persisted shape.  Public agent
+    // reads add derived display fields, which are neither locked nor written
+    // and would make a full-row CAS spuriously fail.
+    const existing = await getStoredById(id);
     if (!existing) return null;
 
     if (existing.status === "terminated" && data.status && data.status !== "terminated") {
@@ -470,10 +484,16 @@ export function agentService(db: Db) {
         throw conflict("Pending approval agents cannot be activated directly");
       }
       const beforeConfig = shouldRecordRevision ? buildSanitizedConfigSnapshot(lockedExisting) : null;
+      // The preceding FOR UPDATE lock plus the exact persisted pre-lock
+      // snapshot comparison are the CAS boundary.  Do not bind the update to
+      // a JavaScript Date value here: PostgreSQL preserves microseconds while
+      // the driver materializes milliseconds, which can reject an unchanged
+      // row.  A concurrent writer is either visible in lockedExisting (and
+      // rejected above) or waits until this transaction commits.
       const updated = await tx
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
-        .where(and(eq(agents.id, id), eq(agents.updatedAt, lockedExisting.updatedAt)))
+        .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;

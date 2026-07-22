@@ -202,11 +202,17 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       lastHeartbeatAt: null,
     });
 
-    await agentService(db).update(created.id, {
+    const updated = await agentService(db).update(created.id, {
       adapterConfig: {
         env: {
           NEW_KEY: { type: "secret_ref", secretId: nextSecret.id, version: "latest" },
         },
+      },
+    });
+
+    expect(updated?.adapterConfig).toMatchObject({
+      env: {
+        NEW_KEY: { type: "secret_ref", secretId: nextSecret.id, version: "latest" },
       },
     });
 
@@ -224,6 +230,47 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       secretId: nextSecret.id,
       configPath: "env.NEW_KEY",
     });
+  });
+
+  it("rejects a writer interleaved between the persisted pre-read and row lock", async () => {
+    const companyId = await seedCompany();
+    const created = await agentService(db).create(companyId, {
+      name: "CAS Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+
+    let interleavedWriterRan = false;
+    const racedDb = new Proxy(db, {
+      get(target, property) {
+        if (property !== "transaction") return Reflect.get(target, property, target);
+        return async (...args: unknown[]) => {
+          if (!interleavedWriterRan) {
+            interleavedWriterRan = true;
+            await db
+              .update(agents)
+              .set({ title: "written-between-read-and-lock", updatedAt: new Date() })
+              .where(eq(agents.id, created.id));
+          }
+          return (target.transaction as (...transactionArgs: unknown[]) => unknown)(...args);
+        };
+      },
+    }) as typeof db;
+
+    await expect(agentService(racedDb).update(created.id, { title: "caller-write" }))
+      .rejects.toThrow("Agent changed concurrently");
+    expect(interleavedWriterRan).toBe(true);
+
+    const reloaded = await db
+      .select({ title: agents.title })
+      .from(agents)
+      .where(eq(agents.id, created.id))
+      .then((rows) => rows[0]);
+    expect(reloaded?.title).toBe("written-between-read-and-lock");
   });
 
   it("backfills missing secret bindings when a legacy pending agent is approved", async () => {
