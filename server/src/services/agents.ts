@@ -85,7 +85,7 @@ function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function buildConfigSnapshot(
+export function buildSanitizedConfigSnapshot(
   row: Pick<typeof agents.$inferSelect, ConfigRevisionField>,
 ): AgentConfigSnapshot {
   const adapterConfig =
@@ -442,14 +442,38 @@ export function agentService(db: Db) {
     }
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
-    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      await tx.execute(sql`SELECT id FROM agents WHERE id = ${id} FOR UPDATE`);
+      const lockedExisting = await txDb
+        .select()
+        .from(agents)
+        .where(eq(agents.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!lockedExisting) return null;
+      if (
+        lockedExisting.updatedAt.getTime() !== existing.updatedAt.getTime() ||
+        !jsonEqual(lockedExisting, existing)
+      ) {
+        throw conflict("Agent changed concurrently; retry with a fresh configuration head");
+      }
+      if (lockedExisting.status === "terminated" && data.status && data.status !== "terminated") {
+        throw conflict("Terminated agents cannot be resumed");
+      }
+      if (
+        lockedExisting.status === "pending_approval" &&
+        data.status &&
+        data.status !== "pending_approval" &&
+        data.status !== "terminated"
+      ) {
+        throw conflict("Pending approval agents cannot be activated directly");
+      }
+      const beforeConfig = shouldRecordRevision ? buildSanitizedConfigSnapshot(lockedExisting) : null;
       const updated = await tx
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), eq(agents.updatedAt, lockedExisting.updatedAt)))
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
@@ -464,7 +488,7 @@ export function agentService(db: Db) {
       }
 
       if (shouldRecordRevision && beforeConfig) {
-        const afterConfig = buildConfigSnapshot(normalizedUpdated);
+        const afterConfig = buildSanitizedConfigSnapshot(normalizedUpdated);
         const changedKeys = diffConfigSnapshot(beforeConfig, afterConfig);
         if (changedKeys.length > 0) {
           await tx.insert(agentConfigRevisions).values({

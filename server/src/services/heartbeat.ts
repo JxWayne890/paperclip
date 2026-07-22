@@ -27,6 +27,7 @@ import {
 import {
   agents,
   agentConfigRevisions,
+  agentMaintenanceFences,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
@@ -4998,6 +4999,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return evaluateAgentInvokabilityFromDb(db, agent);
   }
 
+  /**
+   * Admission always re-reads the agent after taking the same row lock used by
+   * a maintenance restore. The early eligibility read in enqueueWakeup is only
+   * a fast-path; it must never authorize an eventual queue or claim.
+   */
+  async function readLockedAdmission(
+    txDb: Db,
+    agentId: string,
+    companyId: string,
+  ): Promise<{ agent: typeof agents.$inferSelect; invokable: boolean; reason: string | null }> {
+    await txDb.execute(sql`
+      SELECT id FROM agents WHERE id = ${agentId} AND company_id = ${companyId} FOR UPDATE
+    `);
+    const locked = await txDb
+      .select()
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!locked) throw notFound("Agent not found");
+    const fence = await txDb
+      .select({ agentId: agentMaintenanceFences.agentId })
+      .from(agentMaintenanceFences)
+      .where(and(
+        eq(agentMaintenanceFences.agentId, agentId),
+        eq(agentMaintenanceFences.companyId, companyId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (fence) return { agent: locked, invokable: false, reason: "maintenance_fence" };
+    const invokability = await evaluateAgentInvokabilityFromDb(txDb, locked);
+    return {
+      agent: locked,
+      invokable: invokability.invokable,
+      reason: invokability.invokable ? null : invokability.reason,
+    };
+  }
+
   function toAgentOrgRow(agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "reportsTo" | "status">): AgentOrgRow {
     return {
       id: agent.id,
@@ -9086,17 +9123,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const claimResult = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const admission = await readLockedAdmission(txDb, run.agentId, run.companyId);
+      if (!admission.invokable) return { claimed: null, blockedReason: admission.reason };
+      const claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          responsibleUserId,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return { claimed, blockedReason: null };
+    });
+    if (claimResult.blockedReason) {
+      await cancelRunInternal(run.id, `Cancelled because admission closed: ${claimResult.blockedReason}`);
+      return null;
+    }
+    const claimed = claimResult.claimed;
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -13411,6 +13459,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const outcome = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const admission = await readLockedAdmission(txDb, agentId, agent.companyId);
+        if (!admission.invokable) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "agent.not_invokable_after_lock",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
@@ -14000,9 +14066,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
-      );
+      const txDb = tx as unknown as Db;
+      const admission = await readLockedAdmission(txDb, agentId, agent.companyId);
+      if (!admission.invokable) {
+        await tx.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason: "agent.not_invokable_after_lock",
+          payload,
+          status: "skipped",
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          finishedAt: new Date(),
+        });
+        return { kind: "skipped" as const };
+      }
 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {

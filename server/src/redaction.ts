@@ -39,6 +39,16 @@ const SECRET_TEXT_HINTS = [
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
 
+/** Keep trusted internal configuration checks aligned with public redaction. */
+export function isSensitiveRecordKey(key: string): boolean {
+  return SECRET_PAYLOAD_KEY_RE.test(key);
+}
+
+/** A JWT-shaped value is redacted even when its surrounding key is not. */
+export function isJwtLikeSensitiveValue(value: unknown): value is string {
+  return typeof value === "string" && JWT_VALUE_RE.test(value);
+}
+
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
   return SECRET_TEXT_HINTS.some((hint) => lower.includes(hint)) || input.includes(".");
@@ -102,7 +112,7 @@ export function sanitizeRecord(record: Record<string, unknown>): Record<string, 
       redacted[key] = redactSensitiveText(value);
       continue;
     }
-    if (SECRET_PAYLOAD_KEY_RE.test(key)) {
+    if (isSensitiveRecordKey(key)) {
       if (isSecretRefBinding(value)) {
         redacted[key] = sanitizeValue(value);
         continue;
@@ -118,7 +128,7 @@ export function sanitizeRecord(record: Record<string, unknown>): Record<string, 
       redacted[key] = REDACTED_EVENT_VALUE;
       continue;
     }
-    if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
+    if (isJwtLikeSensitiveValue(value)) {
       redacted[key] = REDACTED_EVENT_VALUE;
       continue;
     }
