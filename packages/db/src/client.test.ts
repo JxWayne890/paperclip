@@ -1,10 +1,11 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   applyPendingMigrations,
   inspectMigrations,
+  reconcilePendingMigrationHistory,
 } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -27,6 +28,22 @@ async function migrationHash(migrationFile: string): Promise<string> {
     "utf8",
   );
   return createHash("sha256").update(content).digest("hex");
+}
+
+type Deferred = { promise: Promise<void>; resolve: () => void };
+
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => { resolve = settle; });
+  return { promise, resolve };
+}
+
+async function settlePending(...pending: Array<Promise<unknown> | null | undefined>): Promise<void> {
+  const live: Promise<unknown>[] = [];
+  for (const entry of pending) {
+    if (entry) live.push(entry);
+  }
+  await Promise.allSettled(live);
 }
 
 const userVisibleUpdatedAtTables = new Set([
@@ -1271,5 +1288,683 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       }
     },
     20_000,
+  );
+
+  it(
+    "replays the attested recovery integrity migration safely after a lost journal entry",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+
+      const integrityHash = await migrationHash("0139_attested_recovery_integrity_and_privileges.sql");
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${integrityHash}'`,
+        );
+      } finally {
+        await sql.end();
+      }
+
+      const pending = await inspectMigrations(connectionString);
+      expect(pending).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0139_attested_recovery_integrity_and_privileges.sql"],
+      });
+      // The generic reconciler cannot prove arbitrary DO blocks from catalog
+      // text. It must leave this migration pending rather than guessing; the
+      // migration itself is safe to execute again and recreates the journal
+      // record through the ordinary migration runner.
+      const reconcile = await reconcilePendingMigrationHistory(connectionString);
+      expect(reconcile.remainingMigrations).toEqual(["0139_attested_recovery_integrity_and_privileges.sql"]);
+
+      await applyPendingMigrations(connectionString);
+      await applyPendingMigrations(connectionString);
+      expect(await inspectMigrations(connectionString)).toMatchObject({ status: "upToDate" });
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const constraints = await verifySql.unsafe<{ conname: string }[]>(`
+          SELECT conname FROM pg_constraint
+          WHERE conrelid = 'public.attested_config_restore_operations'::regclass
+            AND conname IN (
+              'attested_restore_operation_status_check',
+              'attested_restore_operation_terminal_shape_check',
+              'attested_restore_operation_fence_release_pair_check'
+            )
+          ORDER BY conname
+        `);
+        expect(constraints.map((row) => row.conname)).toEqual([
+          "attested_restore_operation_fence_release_pair_check",
+          "attested_restore_operation_status_check",
+          "attested_restore_operation_terminal_shape_check",
+        ]);
+      } finally {
+        await verifySql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "replays the 0140 work-guard migration safely after a lost journal entry",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+
+      const workGuardHash = await migrationHash("0140_agent_maintenance_fence_work_guard.sql");
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${workGuardHash}'`,
+        );
+      } finally {
+        await sql.end();
+      }
+
+      const pending = await inspectMigrations(connectionString);
+      expect(pending).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0140_agent_maintenance_fence_work_guard.sql"],
+      });
+      // 0140 owns only replaceable functions and drop/create trigger pairs;
+      // replay must be safe when DDL committed before the migration journal.
+      await applyPendingMigrations(connectionString);
+      await applyPendingMigrations(connectionString);
+      expect(await inspectMigrations(connectionString)).toMatchObject({ status: "upToDate" });
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const triggers = await verifySql.unsafe<{ tgname: string }[]>(`
+          SELECT tgname FROM pg_trigger
+          WHERE NOT tgisinternal
+            AND tgname IN (
+              'agent_wakeup_requests_guard_active_work_insert',
+              'agent_wakeup_requests_guard_active_work_update',
+              'heartbeat_runs_guard_active_work_insert',
+              'heartbeat_runs_guard_active_work_update'
+            )
+          ORDER BY tgname
+        `);
+        expect(triggers.map((row) => row.tgname)).toEqual([
+          "agent_wakeup_requests_guard_active_work_insert",
+          "agent_wakeup_requests_guard_active_work_update",
+          "heartbeat_runs_guard_active_work_insert",
+          "heartbeat_runs_guard_active_work_update",
+        ]);
+      } finally {
+        await verifySql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "replays the Gate/candidate tuple hardening migrations after lost journal entries and enforces physical non-nullability",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+
+      const gateHash = await migrationHash("0141_attested_recovery_gate_binding.sql");
+      const tupleHash = await migrationHash("0142_attested_recovery_candidate_tuple.sql");
+      const notNullHash = await migrationHash("0143_attested_recovery_tuple_not_null.sql");
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe(`
+          DELETE FROM "drizzle"."__drizzle_migrations"
+          WHERE hash IN ('${gateHash}', '${tupleHash}', '${notNullHash}')
+        `);
+      } finally {
+        await sql.end();
+      }
+
+      await applyPendingMigrations(connectionString);
+      await applyPendingMigrations(connectionString);
+      expect(await inspectMigrations(connectionString)).toMatchObject({ status: "upToDate" });
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const columns = await verifySql.unsafe<{ column_name: string; is_nullable: string }[]>(`
+          SELECT column_name, is_nullable
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'attested_config_restore_operations'
+            AND column_name IN (
+              'gate_agent_id', 'backup_gate_latest_revision_id',
+              'cutover_generation', 'cutover_required_patch'
+            )
+          ORDER BY column_name
+        `);
+        expect(columns).toEqual([
+          { column_name: "backup_gate_latest_revision_id", is_nullable: "NO" },
+          { column_name: "cutover_generation", is_nullable: "NO" },
+          { column_name: "cutover_required_patch", is_nullable: "NO" },
+          { column_name: "gate_agent_id", is_nullable: "NO" },
+        ]);
+      } finally {
+        await verifySql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "rejects a raw fence insert that races a locked raw status transition",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const operationId = randomUUID();
+      const seedSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const statusSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const fenceSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const observerSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const fenceWriterApplicationName = `attested-fence-race-${agentId}`;
+      const statusWriterMayCommit = deferred();
+      const statusWriterHasLock = deferred();
+      let statusWriter: Promise<void> | null = null;
+      let fenceResult: Promise<{ ok: true } | { ok: false; error: unknown }> | null = null;
+
+      try {
+        await seedSql`
+          INSERT INTO companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+          VALUES (${companyId}, 'Fence race company', 'FRC', false)
+        `;
+        await seedSql`
+          INSERT INTO agents (id, company_id, name, role, status, adapter_type, adapter_config)
+          VALUES (${agentId}, ${companyId}, 'Fence race agent', 'researcher', 'paused', 'process', '{}'::jsonb)
+        `;
+
+        statusWriter = statusSql.begin(async (tx) => {
+          await tx`SELECT id FROM agents WHERE id = ${agentId} FOR UPDATE`;
+          statusWriterHasLock.resolve();
+          await statusWriterMayCommit.promise;
+          await tx`UPDATE agents SET status = 'idle' WHERE id = ${agentId}`;
+        });
+        await statusWriterHasLock.promise;
+        await fenceSql`SELECT set_config('application_name', ${fenceWriterApplicationName}, false)`;
+        const writerIdentity = await fenceSql<{ pid: number }[]>`SELECT pg_backend_pid() AS pid`;
+        const fenceWriterPid = writerIdentity[0]?.pid;
+        expect(typeof fenceWriterPid).toBe("number");
+
+        // postgres-js query objects are lazy. Attaching a completion handler
+        // starts this INSERT before the observer looks for its lock wait.
+        fenceResult = fenceSql`
+          /* attested-fence-write-race */
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${operationId}, 'attested_backup_restore')
+        `.then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+
+        const deadline = Date.now() + 2_000;
+        let writerBlocked = false;
+        while (Date.now() < deadline) {
+          const rows = await observerSql<{ wait_event_type: string | null }[]>`
+            SELECT wait_event_type
+            FROM pg_stat_activity
+            WHERE pid = ${fenceWriterPid!}
+              AND application_name = ${fenceWriterApplicationName}
+              AND query LIKE '%attested-fence-write-race%'
+            LIMIT 1
+          `;
+          if (rows[0]?.wait_event_type === "Lock") {
+            writerBlocked = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(writerBlocked).toBe(true);
+
+        statusWriterMayCommit.resolve();
+        await statusWriter;
+        const fence = await fenceResult;
+        expect(fence.ok).toBe(false);
+        if (!fence.ok) expect(String(fence.error)).toMatch(/maintenance fence requires a non-invokable agent/i);
+        const rows = await seedSql<{ status: string }[]>`
+          SELECT status FROM agents WHERE id = ${agentId}
+        `;
+        expect(rows).toEqual([{ status: "idle" }]);
+        const fences = await seedSql<{ count: string }[]>`
+          SELECT count(*)::text AS count FROM agent_maintenance_fences WHERE agent_id = ${agentId}
+        `;
+        expect(fences).toEqual([{ count: "0" }]);
+      } finally {
+        // A failed assertion before the release must not strand either
+        // two-session query or hide the real failure behind CONNECTION_CLOSED.
+        statusWriterMayCommit.resolve();
+        await settlePending(statusWriter, fenceResult);
+        await Promise.all([seedSql.end(), statusSql.end(), fenceSql.end(), observerSql.end()]);
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "enforces drained fence insertion and rejects raw active wake/run resurrection",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const companyId = randomUUID();
+      const otherCompanyId = randomUUID();
+      const agentId = randomUUID();
+      const fenceOperationId = randomUUID();
+      const wakeId = randomUUID();
+      const runId = randomUUID();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql`
+          INSERT INTO companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+          VALUES
+            (${companyId}, 'Work guard company', 'WGC', false),
+            (${otherCompanyId}, 'Work guard other company', 'WGO', false)
+        `;
+        await sql`
+          INSERT INTO agents (id, company_id, name, role, status, adapter_type, adapter_config)
+          VALUES (${agentId}, ${companyId}, 'Work guard agent', 'researcher', 'idle', 'process', '{}'::jsonb)
+        `;
+
+        // These are the exact raw/stale-binary writes which were previously
+        // able to create fenced+active residue. Normal active->active
+        // lifecycle changes remain valid before a fence exists.
+        await sql`
+          INSERT INTO agent_wakeup_requests (id, company_id, agent_id, source, status)
+          VALUES (${wakeId}, ${companyId}, ${agentId}, 'db-work-guard-test', 'queued')
+        `;
+        await sql`
+          INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
+          VALUES (${runId}, ${companyId}, ${agentId}, 'queued')
+        `;
+        await sql`UPDATE agent_wakeup_requests SET status = 'claimed' WHERE id = ${wakeId}`;
+        await sql`UPDATE heartbeat_runs SET status = 'running' WHERE id = ${runId}`;
+        // The legacy status columns have no CHECK constraints. An unknown
+        // value is intentionally nonterminal and must block fence drain.
+        await sql`UPDATE agent_wakeup_requests SET status = 'future_wake_state' WHERE id = ${wakeId}`;
+        await sql`UPDATE heartbeat_runs SET status = 'future_run_state' WHERE id = ${runId}`;
+        await expect(sql`
+          UPDATE agent_wakeup_requests
+          SET company_id = ${otherCompanyId}
+          WHERE id = ${wakeId}
+        `).rejects.toThrow(/wake request identity is immutable/i);
+        await expect(sql`
+          INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
+          VALUES (${randomUUID()}, ${otherCompanyId}, ${agentId}, 'queued')
+        `).rejects.toThrow(/active work agent scope is invalid/i);
+
+        await sql`UPDATE agents SET status = 'paused' WHERE id = ${agentId}`;
+        await expect(sql`
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${fenceOperationId}, 'attested_backup_restore')
+        `).rejects.toThrow(/maintenance fence requires zero active work/i);
+
+        await sql`UPDATE agent_wakeup_requests SET status = 'cancelled' WHERE id = ${wakeId}`;
+        await sql`UPDATE heartbeat_runs SET status = 'cancelled' WHERE id = ${runId}`;
+        // Terminal resurrection is not a lifecycle transition, even before
+        // the fence exists. Rejecting it outright is what lets fence drain
+        // count without ever taking a work row lock after the agent lock.
+        await expect(sql`
+          UPDATE agent_wakeup_requests SET status = 'queued' WHERE id = ${wakeId}
+        `).rejects.toThrow(/terminal wake requests cannot be reactivated/i);
+        await expect(sql`
+          UPDATE heartbeat_runs SET status = 'queued' WHERE id = ${runId}
+        `).rejects.toThrow(/terminal heartbeat runs cannot be reactivated/i);
+        await sql`
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${fenceOperationId}, 'attested_backup_restore')
+        `;
+
+        await expect(sql`
+          INSERT INTO agent_wakeup_requests (id, company_id, agent_id, source, status)
+          VALUES (${randomUUID()}, ${companyId}, ${agentId}, 'db-work-guard-test', 'queued')
+        `).rejects.toThrow(/non-invokable agent status prevents active work admission/i);
+        await expect(sql`
+          INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
+          VALUES (${randomUUID()}, ${companyId}, ${agentId}, 'queued')
+        `).rejects.toThrow(/non-invokable agent status prevents active work admission/i);
+        await expect(sql`
+          UPDATE agent_wakeup_requests SET status = 'queued' WHERE id = ${wakeId}
+        `).rejects.toThrow(/terminal wake requests cannot be reactivated/i);
+        await expect(sql`
+          UPDATE heartbeat_runs SET status = 'queued' WHERE id = ${runId}
+        `).rejects.toThrow(/terminal heartbeat runs cannot be reactivated/i);
+
+        const residue = await sql<{ fences: string; active_wakes: string; active_runs: string }[]>`
+          SELECT
+            (SELECT count(*)::text FROM agent_maintenance_fences WHERE agent_id = ${agentId}) AS fences,
+            (SELECT count(*)::text FROM agent_wakeup_requests
+             WHERE agent_id = ${agentId} AND status IN ('queued', 'deferred_issue_execution', 'claimed')) AS active_wakes,
+            (SELECT count(*)::text FROM heartbeat_runs
+             WHERE agent_id = ${agentId} AND status IN ('queued', 'running', 'scheduled_retry')) AS active_runs
+        `;
+        expect(residue).toEqual([{ fences: '1', active_wakes: '0', active_runs: '0' }]);
+      } finally {
+        await sql.end();
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "safely false-rejects fence insertion while a terminalizer is uncommitted, then succeeds on retry",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const wakeId = randomUUID();
+      const seedSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const terminalizerSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const fenceSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const terminalizerMayCommit = deferred();
+      const terminalizerHasChanged = deferred();
+      let terminalizer: Promise<void> | null = null;
+      try {
+        await seedSql`
+          INSERT INTO companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+          VALUES (${companyId}, 'Terminalizer fence company', 'TFC', false)
+        `;
+        await seedSql`
+          INSERT INTO agents (id, company_id, name, role, status, adapter_type, adapter_config)
+          VALUES (${agentId}, ${companyId}, 'Terminalizer fence agent', 'researcher', 'active', 'process', '{}'::jsonb)
+        `;
+        await seedSql`
+          INSERT INTO agent_wakeup_requests (id, company_id, agent_id, source, status)
+          VALUES (${wakeId}, ${companyId}, ${agentId}, 'db-terminalizer-test', 'queued')
+        `;
+        await seedSql`UPDATE agents SET status = 'paused' WHERE id = ${agentId}`;
+
+        terminalizer = terminalizerSql.begin(async (tx) => {
+          await tx`UPDATE agent_wakeup_requests SET status = 'cancelled' WHERE id = ${wakeId}`;
+          terminalizerHasChanged.resolve();
+          await terminalizerMayCommit.promise;
+        });
+        await terminalizerHasChanged.promise;
+
+        // The fence owns the agent but intentionally does not lock the wake
+        // tuple. READ COMMITTED sees the last committed queued state and
+        // rejects; it cannot deadlock with this terminalizer's work lock.
+        await expect(fenceSql`
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${randomUUID()}, 'attested_backup_restore')
+        `).rejects.toThrow(/maintenance fence requires zero active work/i);
+
+        terminalizerMayCommit.resolve();
+        await terminalizer;
+        await fenceSql`
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${randomUUID()}, 'attested_backup_restore')
+        `;
+        const state = await seedSql<{ status: string; fences: string }[]>`
+          SELECT
+            (SELECT status FROM agent_wakeup_requests WHERE id = ${wakeId}) AS status,
+            (SELECT count(*)::text FROM agent_maintenance_fences WHERE agent_id = ${agentId}) AS fences
+        `;
+        expect(state).toEqual([{ status: 'cancelled', fences: '1' }]);
+      } finally {
+        terminalizerMayCommit.resolve();
+        await settlePending(terminalizer);
+        await Promise.all([seedSql.end(), terminalizerSql.end(), fenceSql.end()]);
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "counts work globally by agent and rejects cross-company work corruption during fence insertion",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const companyId = randomUUID();
+      const otherCompanyId = randomUUID();
+      const agentId = randomUUID();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql`
+          INSERT INTO companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+          VALUES
+            (${companyId}, 'Work scope company', 'WSC', false),
+            (${otherCompanyId}, 'Work scope other company', 'WSO', false)
+        `;
+        await sql`
+          INSERT INTO agents (id, company_id, name, role, status, adapter_type, adapter_config)
+          VALUES (${agentId}, ${companyId}, 'Work scope agent', 'researcher', 'paused', 'process', '{}'::jsonb)
+        `;
+        // Independent work-table FKs allow historical/corrupt terminal rows
+        // with the wrong company. The fence must surface, never ignore, them.
+        await sql`
+          INSERT INTO agent_wakeup_requests (id, company_id, agent_id, source, status)
+          VALUES (${randomUUID()}, ${otherCompanyId}, ${agentId}, 'db-work-scope-test', 'cancelled')
+        `;
+        await expect(sql`
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${randomUUID()}, 'attested_backup_restore')
+        `).rejects.toThrow(/maintenance fence work scope is corrupt/i);
+      } finally {
+        await sql.end();
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "serializes raw active insertion before fence drain without an opposite-order deadlock",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const wakeId = randomUUID();
+      const operationId = randomUUID();
+      const seedSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const wakeSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const fenceSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const observerSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const fenceWriterApplicationName = `attested-work-fence-race-${agentId}`;
+      const wakeWriterMayCommit = deferred();
+      const wakeWriterHasLock = deferred();
+      let wakeWriter: Promise<void> | null = null;
+      let fenceResult: Promise<{ ok: true } | { ok: false; error: unknown }> | null = null;
+
+      try {
+        await seedSql`
+          INSERT INTO companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+          VALUES (${companyId}, 'Work/fence ordering company', 'WFO', false)
+        `;
+        await seedSql`
+          INSERT INTO agents (id, company_id, name, role, status, adapter_type, adapter_config)
+          VALUES (${agentId}, ${companyId}, 'Work/fence ordering agent', 'researcher', 'active', 'process', '{}'::jsonb)
+        `;
+
+        // Active INSERT takes agent->work. Hold the same first lock explicitly
+        // so the fence's agent lock is observably blocked, then let the insert
+        // commit. Fence wakes, sees active work, and rejects without an
+        // agent/work opposite-order cycle.
+        wakeWriter = wakeSql.begin(async (tx) => {
+          await tx`SELECT id FROM agents WHERE id = ${agentId} FOR UPDATE`;
+          wakeWriterHasLock.resolve();
+          await wakeWriterMayCommit.promise;
+          await tx`
+            INSERT INTO agent_wakeup_requests (id, company_id, agent_id, source, status)
+            VALUES (${wakeId}, ${companyId}, ${agentId}, 'db-work-ordering-test', 'queued')
+          `;
+          await tx`UPDATE agents SET status = 'paused' WHERE id = ${agentId}`;
+        });
+        await wakeWriterHasLock.promise;
+        await fenceSql`SELECT set_config('application_name', ${fenceWriterApplicationName}, false)`;
+        const writerIdentity = await fenceSql<{ pid: number }[]>`SELECT pg_backend_pid() AS pid`;
+        const fenceWriterPid = writerIdentity[0]?.pid;
+        expect(typeof fenceWriterPid).toBe('number');
+        fenceResult = fenceSql`
+          /* attested-work-fence-opposite-order-race */
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${operationId}, 'attested_backup_restore')
+        `.then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+
+        const deadline = Date.now() + 2_000;
+        let fenceWriterBlocked = false;
+        while (Date.now() < deadline) {
+          const rows = await observerSql<{ wait_event_type: string | null }[]>`
+            SELECT wait_event_type
+            FROM pg_stat_activity
+            WHERE pid = ${fenceWriterPid!}
+              AND application_name = ${fenceWriterApplicationName}
+              AND query LIKE '%attested-work-fence-opposite-order-race%'
+            LIMIT 1
+          `;
+          if (rows[0]?.wait_event_type === 'Lock') {
+            fenceWriterBlocked = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(fenceWriterBlocked).toBe(true);
+
+        wakeWriterMayCommit.resolve();
+        await wakeWriter;
+        const fence = await fenceResult;
+        expect(fence.ok).toBe(false);
+        if (!fence.ok) expect(String(fence.error)).toMatch(/maintenance fence requires zero active work/i);
+
+        await seedSql`UPDATE agent_wakeup_requests SET status = 'cancelled' WHERE id = ${wakeId}`;
+        await seedSql`
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${operationId}, 'attested_backup_restore')
+        `;
+        const final = await seedSql<{ wake_status: string; fences: string }[]>`
+          SELECT
+            (SELECT status FROM agent_wakeup_requests WHERE id = ${wakeId}) AS wake_status,
+            (SELECT count(*)::text FROM agent_maintenance_fences WHERE agent_id = ${agentId}) AS fences
+        `;
+        expect(final).toEqual([{ wake_status: 'cancelled', fences: '1' }]);
+      } finally {
+        wakeWriterMayCommit.resolve();
+        await settlePending(wakeWriter, fenceResult);
+        await Promise.all([seedSql.end(), wakeSql.end(), fenceSql.end(), observerSql.end()]);
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "blocks a concurrent raw active insert behind a committed fence and leaves no active residue",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const operationId = randomUUID();
+      const seedSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const fenceSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const activeSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const observerSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      // PostgreSQL limits application_name to 63 bytes; keep this writer
+      // identity below that bound so the observer proves the exact session.
+      const activeWriterApplicationName = `attested-aw-${agentId}`;
+      const fenceMayCommit = deferred();
+      const fenceIsInstalled = deferred();
+      let fenceWriter: Promise<void> | null = null;
+      let activeResult: Promise<{ ok: true } | { ok: false; error: unknown }> | null = null;
+      try {
+        await seedSql`
+          INSERT INTO companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+          VALUES (${companyId}, 'Fence admission company', 'FAC', false)
+        `;
+        await seedSql`
+          INSERT INTO agents (id, company_id, name, role, status, adapter_type, adapter_config)
+          VALUES (${agentId}, ${companyId}, 'Fence admission agent', 'researcher', 'paused', 'process', '{}'::jsonb)
+        `;
+
+        fenceWriter = fenceSql.begin(async (tx) => {
+          await tx`
+            INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+            VALUES (${agentId}, ${companyId}, ${operationId}, 'attested_backup_restore')
+          `;
+          fenceIsInstalled.resolve();
+          await fenceMayCommit.promise;
+        });
+        await fenceIsInstalled.promise;
+
+        await activeSql`SELECT set_config('application_name', ${activeWriterApplicationName}, false)`;
+        const writerIdentity = await activeSql<{ pid: number }[]>`SELECT pg_backend_pid() AS pid`;
+        const activeWriterPid = writerIdentity[0]?.pid;
+        expect(typeof activeWriterPid).toBe('number');
+        // Attaching a handler starts postgres-js's lazy query before polling.
+        activeResult = activeSql`
+          /* attested-active-insert-after-fence-race */
+          INSERT INTO heartbeat_runs (id, company_id, agent_id, status)
+          VALUES (${randomUUID()}, ${companyId}, ${agentId}, 'queued')
+        `.then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+
+        const deadline = Date.now() + 2_000;
+        let activeWriterBlocked = false;
+        while (Date.now() < deadline) {
+          const rows = await observerSql<{ application_name: string; blocked: boolean }[]>`
+            SELECT application_name,
+                   EXISTS (SELECT 1 FROM pg_locks WHERE pid = ${activeWriterPid!} AND NOT granted) AS blocked
+            FROM pg_stat_activity
+            WHERE pid = ${activeWriterPid!}
+            LIMIT 1
+          `;
+          if (rows[0]?.application_name === activeWriterApplicationName && rows[0]?.blocked) {
+            activeWriterBlocked = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(activeWriterBlocked).toBe(true);
+
+        fenceMayCommit.resolve();
+        await fenceWriter;
+        const active = await activeResult;
+        expect(active.ok).toBe(false);
+        if (!active.ok) expect(String(active.error)).toMatch(/non-invokable agent status prevents active work admission/i);
+        const residue = await seedSql<{ fences: string; active_runs: string }[]>`
+          SELECT
+            (SELECT count(*)::text FROM agent_maintenance_fences WHERE agent_id = ${agentId}) AS fences,
+            (SELECT count(*)::text FROM heartbeat_runs
+             WHERE agent_id = ${agentId} AND status IN ('queued', 'running', 'scheduled_retry')) AS active_runs
+        `;
+        expect(residue).toEqual([{ fences: '1', active_runs: '0' }]);
+      } finally {
+        fenceMayCommit.resolve();
+        await settlePending(fenceWriter, activeResult);
+        await Promise.all([seedSql.end(), fenceSql.end(), activeSql.end(), observerSql.end()]);
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "makes maintenance fence rows write-once so release cannot deadlock with a raw identity update",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql`
+          INSERT INTO companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+          VALUES (${companyId}, 'Fence immutability company', 'FIM', false)
+        `;
+        await sql`
+          INSERT INTO agents (id, company_id, name, role, status, adapter_type, adapter_config)
+          VALUES (${agentId}, ${companyId}, 'Fence immutability agent', 'researcher', 'paused', 'process', '{}'::jsonb)
+        `;
+        await sql`
+          INSERT INTO agent_maintenance_fences (agent_id, company_id, operation_id, reason)
+          VALUES (${agentId}, ${companyId}, ${randomUUID()}, 'attested_backup_restore')
+        `;
+        await expect(sql`
+          UPDATE agent_maintenance_fences
+          SET reason = 'mutated'
+          WHERE agent_id = ${agentId}
+        `).rejects.toThrow(/maintenance fences are immutable/i);
+      } finally {
+        await sql.end();
+      }
+    },
+    10_000,
   );
 });

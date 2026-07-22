@@ -5009,22 +5009,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     companyId: string,
   ): Promise<{ agent: typeof agents.$inferSelect; invokable: boolean; reason: string | null }> {
-    await txDb.execute(sql`
-      SELECT id FROM agents WHERE id = ${agentId} AND company_id = ${companyId} FOR UPDATE
-    `);
     const locked = await txDb
       .select()
       .from(agents)
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+      .for("update")
       .then((rows) => rows[0] ?? null);
     if (!locked) throw notFound("Agent not found");
+    return readAdmissionForLockedAgent(txDb, locked);
+  }
+
+  /**
+   * Evaluate a row that the caller has already locked.  Recovery promotion
+   * locks the company's agent rows, sorted by id, before it ever takes an
+   * issue lock; keeping this separate prevents a later admission check from
+   * silently reintroducing an agent-after-issue lock acquisition.
+   */
+  async function readAdmissionForLockedAgent(
+    txDb: Db,
+    locked: typeof agents.$inferSelect,
+  ): Promise<{ agent: typeof agents.$inferSelect; invokable: boolean; reason: string | null }> {
     const fence = await txDb
       .select({ agentId: agentMaintenanceFences.agentId })
       .from(agentMaintenanceFences)
-      .where(and(
-        eq(agentMaintenanceFences.agentId, agentId),
-        eq(agentMaintenanceFences.companyId, companyId),
-      ))
+      .where(eq(agentMaintenanceFences.agentId, locked.id))
       .then((rows) => rows[0] ?? null);
     if (fence) return { agent: locked, invokable: false, reason: "maintenance_fence" };
     const invokability = await evaluateAgentInvokabilityFromDb(txDb, locked);
@@ -5033,6 +5041,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       invokable: invokability.invokable,
       reason: invokability.invokable ? null : invokability.reason,
     };
+  }
+
+  /**
+   * Rare terminal recovery can promote a deferred wake for a different agent.
+   * Locking every agent in stable order is intentionally broader than the
+   * current candidates: it closes the discovery race without ever taking an
+   * agent lock after an issue lock.  Normal admission only locks one agent and
+   * follows the same agent-before-issue order.
+   */
+  async function lockCompanyAdmissionsBeforeIssue(
+    txDb: Db,
+    companyId: string,
+  ): Promise<Map<string, typeof agents.$inferSelect>> {
+    // Return exactly the rows locked by this one statement. A follow-up plain
+    // SELECT would use a fresh READ COMMITTED snapshot and could falsely add a
+    // just-inserted, unlocked agent to the admission set.
+    const locked = await txDb
+      .select()
+      .from(agents)
+      .where(eq(agents.companyId, companyId))
+      .orderBy(asc(agents.id))
+      .for("update");
+    return new Map(locked.map((agent) => [agent.id, agent]));
   }
 
   function toAgentOrgRow(agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "reportsTo" | "status">): AgentOrgRow {
@@ -7459,9 +7490,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
     const now = new Date();
 
-    const retryRun = await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select id from issues where company_id = ${run.companyId} and execution_run_id = ${run.id} for update`,
+   const retryRun = await db.transaction(async (tx) => {
+      const admission = await readLockedAdmission(tx as unknown as Db, run.agentId, run.companyId);
+      if (!admission.invokable) return null;
+     await tx.execute(
+       sql`select id from issues where company_id = ${run.companyId} and execution_run_id = ${run.id} for update`,
       );
 
       const issue = await tx
@@ -7697,8 +7730,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
-    const queued = await db.transaction(async (tx) => {
-      const wakeupRequest = await tx
+   const queued = await db.transaction(async (tx) => {
+      const admission = await readLockedAdmission(tx as unknown as Db, run.agentId, run.companyId);
+      if (!admission.invokable) return null;
+     const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
           companyId: run.companyId,
@@ -7758,10 +7793,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
       }
 
-      return retryRun;
-    });
+     return retryRun;
+   });
 
-    publishLiveEvent({
+    if (!queued) return null;
+
+   publishLiveEvent({
       companyId: queued.companyId,
       type: "heartbeat.run.queued",
       payload: {
@@ -8056,6 +8093,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
+  /**
+   * The promotion transaction already owns the admission lock.  Keep the
+   * cancellation in that transaction as well so a fence observed at the last
+   * possible instant cannot leave a due retry that later becomes queued.
+   * Lifecycle event emission deliberately happens only after commit.
+   */
+  async function cancelScheduledRetryForGateAfterAdmissionLock(
+    txDb: Db,
+    run: typeof heartbeatRuns.$inferSelect,
+    gate: BlockedScheduledRetryGate,
+    now: Date,
+  ) {
+    const cancelled = await txDb
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: gate.reason,
+        errorCode: gate.errorCode,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          lte(heartbeatRuns.scheduledRetryAt, now),
+        ),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!cancelled) return null;
+
+    if (cancelled.wakeupRequestId) {
+      await txDb
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          error: gate.reason,
+          updatedAt: now,
+        })
+        .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
+    }
+    if (gate.issueId) {
+      await txDb
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.companyId, cancelled.companyId),
+            eq(issues.id, gate.issueId),
+            eq(issues.executionRunId, cancelled.id),
+          ),
+        );
+    }
+    return cancelled;
+  }
+
   async function promoteScheduledRetryRun(
     dueRun: typeof heartbeatRuns.$inferSelect,
     now: Date,
@@ -8117,21 +8217,61 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const promoted = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "queued",
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.id, dueRun.id),
-          eq(heartbeatRuns.status, "scheduled_retry"),
-          lte(heartbeatRuns.scheduledRetryAt, now),
-        ),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const promotion = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const admission = await readLockedAdmission(txDb, dueRun.agentId, dueRun.companyId);
+      if (!admission.invokable) {
+        const closedGate: BlockedScheduledRetryGate = {
+          allowed: false,
+          reason: "Scheduled retry suppressed because admission is closed",
+          errorCode: "agent_not_invokable",
+          issueId: readNonEmptyString(parseObject(dueRun.contextSnapshot).issueId),
+          details: { reason: admission.reason },
+        };
+        return {
+          kind: "suppressed" as const,
+          gate: closedGate,
+          run: await cancelScheduledRetryForGateAfterAdmissionLock(txDb, dueRun, closedGate, now),
+        };
+      }
+      return {
+        kind: "promoted" as const,
+        run: await txDb
+          .update(heartbeatRuns)
+          .set({ status: "queued", updatedAt: now })
+          .where(
+            and(
+              eq(heartbeatRuns.id, dueRun.id),
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              lte(heartbeatRuns.scheduledRetryAt, now),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null),
+      };
+    });
+    if (promotion.kind === "suppressed") {
+      if (!promotion.run) return { outcome: "not_promoted", run: null };
+      await appendRunEvent(promotion.run, await nextRunEventSeq(promotion.run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: promotion.gate.reason,
+        payload: {
+          ...promotion.gate.details,
+          scheduledRetryAttempt: promotion.run.scheduledRetryAttempt,
+          scheduledRetryAt: promotion.run.scheduledRetryAt ? new Date(promotion.run.scheduledRetryAt).toISOString() : null,
+          scheduledRetryReason: promotion.run.scheduledRetryReason,
+        },
+      });
+      return {
+        outcome: "gate_suppressed",
+        run: promotion.run,
+        reason: promotion.gate.reason,
+        errorCode: promotion.gate.errorCode,
+      };
+    }
+    const promoted = promotion.run;
     if (!promoted) return { outcome: "not_promoted", run: null };
 
     await appendRunEvent(promoted, await nextRunEventSeq(promoted.id), {
@@ -8310,6 +8450,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           outcome: "not_scheduled";
           reason: string;
           errorCode:
+            | "agent_not_invokable"
             | "issue_not_found"
             | "issue_reassigned"
             | "issue_cancelled"
@@ -8320,8 +8461,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           details: Record<string, unknown>;
         };
 
-    const scheduleResult = await db.transaction(async (tx): Promise<ScheduledRetryTransactionResult> => {
-      if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
+   const scheduleResult = await db.transaction(async (tx): Promise<ScheduledRetryTransactionResult> => {
+      const admission = await readLockedAdmission(tx as unknown as Db, run.agentId, run.companyId);
+      if (!admission.invokable) {
+        return {
+          outcome: "not_scheduled",
+          reason: "Scheduled retry suppressed because admission is closed",
+          errorCode: "agent_not_invokable",
+          issueId,
+          details: { reason: admission.reason },
+        };
+      }
+     if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
         if (issueId) {
           await tx.execute(
             sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
@@ -8448,8 +8599,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      const wakeupRequest = await tx
-        .insert(agentWakeupRequests)
+     const wakeupRequest = await tx
+       .insert(agentWakeupRequests)
         .values({
           companyId: run.companyId,
           agentId: run.agentId,
@@ -9127,6 +9278,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const txDb = tx as unknown as Db;
       const admission = await readLockedAdmission(txDb, run.agentId, run.companyId);
       if (!admission.invokable) return { claimed: null, blockedReason: admission.reason };
+      // Lock the queued run before its wake request.  The linked wake moves
+      // queued -> claimed in this same agent-locked transaction, so a later
+      // terminal/fence transaction cannot be overwritten by an async
+      // post-claim continuation.
+      const current = await tx
+        .select({ id: heartbeatRuns.id, wakeupRequestId: heartbeatRuns.wakeupRequestId })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!current) return { claimed: null, blockedReason: null };
+      if (current.wakeupRequestId) {
+        const linkedWake = await tx
+          .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.id, current.wakeupRequestId),
+            eq(agentWakeupRequests.companyId, run.companyId),
+            eq(agentWakeupRequests.agentId, run.agentId),
+            eq(agentWakeupRequests.runId, run.id),
+          ))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!linkedWake || (linkedWake.status !== "queued" && linkedWake.status !== "claimed")) {
+          return { claimed: null, blockedReason: "linked wake request is no longer active" };
+        }
+        if (linkedWake.status === "queued") {
+          const claimedWake = await tx
+            .update(agentWakeupRequests)
+            .set({ status: "claimed", claimedAt, updatedAt: claimedAt })
+            .where(and(eq(agentWakeupRequests.id, linkedWake.id), eq(agentWakeupRequests.status, "queued")))
+            .returning({ id: agentWakeupRequests.id })
+            .then((rows) => rows[0] ?? null);
+          if (!claimedWake) throw new Error("Linked wake request changed while its claim lock was held");
+        }
+      }
       const claimed = await tx
         .update(heartbeatRuns)
         .set({
@@ -9138,6 +9325,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);
+      if (!claimed) throw new Error("Queued heartbeat run changed while its claim lock was held");
       return { claimed, blockedReason: null };
     });
     if (claimResult.blockedReason) {
@@ -9163,8 +9351,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
     publishRunLifecyclePluginEvent(claimed);
-
-    await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
 
     // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
     // not at queue time. Guard is idempotent — safe if called more than once.
@@ -9497,7 +9683,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(and(
+        eq(agents.id, agentId),
+        notInArray(agents.status, ["paused", "terminated"]),
+        sql`not exists (
+          select 1 from agent_maintenance_fences
+          where agent_id = ${agentId}
+        )`,
+      ))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -9771,10 +9964,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
-            error: detachedMessage,
-            errorCode: DETACHED_PROCESS_ERROR_CODE,
-          });
+          // This is metadata only. A stale reaper must never rewrite a
+          // terminal status back to running after cancellation/finalization.
+          const detachedRun = await db
+            .update(heartbeatRuns)
+            .set({
+              error: detachedMessage,
+              errorCode: DETACHED_PROCESS_ERROR_CODE,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+            .returning()
+            .then((rows) => rows[0] ?? null);
           if (detachedRun) {
             await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
               eventType: "lifecycle",
@@ -12457,6 +12658,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
     const promotionResult = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const lockedAdmissionAgents = await lockCompanyAdmissionsBeforeIssue(txDb, run.companyId);
       // Lock the context issue (if any) AND every issue that still references this run.
       //
       // A single run can hold execution locks on multiple issues: the caller's context
@@ -12792,8 +12995,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             wakeReason: readNonEmptyString(promotedContextSnapshot.wakeReason),
           });
         }
-        const now = new Date();
-        const newRun = await tx
+       const now = new Date();
+        const lockedDeferredAgent = lockedAdmissionAgents.get(deferredAgent.id);
+        if (!lockedDeferredAgent) {
+          // An agent created after the ordered scan is not protected by the
+          // scan's row locks. Abort the whole transaction (including issue
+          // cleanup) and let the normal terminal-recovery retry start with a
+          // fresh deterministic admission set.
+          throw conflict("Recovery admission set changed; retry before promoting deferred work");
+        }
+        const admission = await readAdmissionForLockedAgent(txDb, lockedDeferredAgent);
+        if (!admission.invokable) return { kind: "released" as const };
+       const newRun = await tx
           .insert(heartbeatRuns)
           .values({
             companyId: deferredAgent.companyId,
@@ -12908,8 +13121,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
 
-        const now = new Date();
-        const wakeupRequest = await tx
+       const now = new Date();
+        const lockedRecoveryAgent = lockedAdmissionAgents.get(recoveryAgent.id);
+        if (!lockedRecoveryAgent) {
+          throw conflict("Recovery admission set changed; retry before promoting review work");
+        }
+        const admission = await readAdmissionForLockedAgent(txDb, lockedRecoveryAgent);
+        if (!admission.invokable) return { kind: "released" as const };
+       const wakeupRequest = await tx
           .insert(agentWakeupRequests)
           .values({
             companyId: issue.companyId,
@@ -13048,8 +13267,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
       const recoverySource =
         issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
-      const now = new Date();
-      const recoveryContextSnapshot = withRecoveryModelProfileHint({
+     const now = new Date();
+      const lockedRecoveryAgent = lockedAdmissionAgents.get(recoveryAgent.id);
+      if (!lockedRecoveryAgent) {
+        throw conflict("Recovery admission set changed; retry before promoting recovery work");
+      }
+      const admission = await readAdmissionForLockedAgent(txDb, lockedRecoveryAgent);
+      if (!admission.invokable) return { kind: "released" as const };
+     const recoveryContextSnapshot = withRecoveryModelProfileHint({
         issueId: issue.id,
         taskId: issue.id,
         wakeReason: recoveryReason,
@@ -14033,36 +14258,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
 
     if (coalescedTargetRun) {
-      const mergedContextSnapshot = mergeCoalescedContextSnapshot(
-        coalescedTargetRun.contextSnapshot,
-        enrichedContextSnapshot,
-      );
-      const mergedRun = await db
-        .update(heartbeatRuns)
-        .set({
-          contextSnapshot: mergedContextSnapshot,
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-        .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
-
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
+      const coalesceResult = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const admission = await readLockedAdmission(txDb, agentId, agent.companyId);
+        if (!admission.invokable) return { kind: "closed" as const };
+        const currentTarget = await txDb
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, coalescedTargetRun.id),
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.companyId, agent.companyId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (!currentTarget || !filterZombieCoalesceTarget(currentTarget, liveRunExecutions)) {
+          return { kind: "missed" as const };
+        }
+        const mergedContextSnapshot = mergeCoalescedContextSnapshot(
+          currentTarget.contextSnapshot,
+          enrichedContextSnapshot,
+        );
+        const mergedRun = await txDb
+          .update(heartbeatRuns)
+          .set({ contextSnapshot: mergedContextSnapshot, updatedAt: new Date() })
+          .where(eq(heartbeatRuns.id, currentTarget.id))
+          .returning()
+          .then((rows) => rows[0] ?? currentTarget);
+        await txDb.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        });
+        return { kind: "coalesced" as const, run: mergedRun };
       });
-      return mergedRun;
+      if (coalesceResult.kind === "coalesced") return coalesceResult.run;
+      if (coalesceResult.kind === "closed") return null;
     }
 
     const queueOutcome = await db.transaction(async (tx) => {

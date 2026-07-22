@@ -19,9 +19,10 @@ export const agentMaintenanceFences = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
-    companyOperationUnique: uniqueIndex("agent_maintenance_fences_company_operation_unique").on(
+    companyOperationAgentUnique: uniqueIndex("agent_maintenance_fences_company_operation_agent_unique").on(
       table.companyId,
       table.operationId,
+      table.agentId,
     ),
   }),
 );

@@ -22,8 +22,14 @@ describe("attested backup private envelope", () => {
     backupCreatedAt: "2026-07-21T15:47:25.000Z",
     latestRevisionId: "00000000-0000-4000-8000-000000000005",
     latestRevisionCreatedAt: "2026-07-21T15:30:00.000Z",
+    gateLatestRevisionId: "00000000-0000-4000-8000-000000000007",
     activityAnchor: { id: "00000000-0000-4000-8000-000000000006", createdAt: "2026-07-21T15:31:00.000Z" },
     agent: { adapterConfig: { protectedField: { type: "plain", value: "fixture" } } },
+    gateAgent: {
+      id: "00000000-0000-4000-8000-000000000008",
+      companyId: "00000000-0000-4000-8000-000000000002",
+      adapterConfig: { protectedField: { type: "plain", value: "gate-fixture" } },
+    },
   };
 
   it("accepts only a valid signed private payload", () => {

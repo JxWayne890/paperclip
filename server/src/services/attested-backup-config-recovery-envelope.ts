@@ -10,8 +10,10 @@ export interface AttestedBackupEnvelope {
   backupCreatedAt: string;
   latestRevisionId: string;
   latestRevisionCreatedAt: string;
+  gateLatestRevisionId: string;
   activityAnchor: { id: string; createdAt: string } | null;
   agent: unknown;
+  gateAgent: unknown;
 }
 
 type SignedBackupEnvelope = {
@@ -57,8 +59,10 @@ export function verifySignedAttestedBackupEnvelope(raw: Buffer, signingSecret: s
     typeof value.backupCreatedAt !== "string" ||
     typeof value.latestRevisionId !== "string" ||
     typeof value.latestRevisionCreatedAt !== "string" ||
+    typeof value.gateLatestRevisionId !== "string" ||
     !(value.activityAnchor === null || (typeof value.activityAnchor?.id === "string" && typeof value.activityAnchor?.createdAt === "string")) ||
-    value.agent === undefined
+    value.agent === undefined ||
+    value.gateAgent === undefined
   ) {
     throw new Error("invalid backup envelope");
   }

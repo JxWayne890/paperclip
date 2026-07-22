@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   agentConfigRevisions,
+  agentMaintenanceFences,
   agentApiKeys,
   agentRuntimeState,
   agentTaskSessions,
@@ -444,26 +445,15 @@ export function agentService(db: Db) {
       const role = (data.role ?? existing.role) as string;
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions, role);
     }
-    if (
-      Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
-      isPlainRecord(normalizedPatch.adapterConfig)
-    ) {
-      normalizedPatch.adapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-        existing.companyId,
-        normalizedPatch.adapterConfig,
-        { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
-      );
-    }
-
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
 
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
-      await tx.execute(sql`SELECT id FROM agents WHERE id = ${id} FOR UPDATE`);
       const lockedExisting = await txDb
         .select()
         .from(agents)
         .where(eq(agents.id, id))
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!lockedExisting) return null;
       if (
@@ -483,6 +473,38 @@ export function agentService(db: Db) {
       ) {
         throw conflict("Pending approval agents cannot be activated directly");
       }
+      if (
+        lockedExisting.status === "paused" &&
+        normalizedPatch.status !== undefined &&
+        normalizedPatch.status !== "paused"
+      ) {
+        const fence = await txDb
+          .select({ agentId: agentMaintenanceFences.agentId })
+          .from(agentMaintenanceFences)
+          .where(eq(agentMaintenanceFences.agentId, id))
+          .then((rows) => rows[0] ?? null);
+        if (fence) throw conflict("Agent maintenance fence prevents resuming this agent");
+      }
+      // Schema-secret normalization can create managed secret rows. Perform
+      // it only after the row/CAS/fence checks and through this transaction,
+      // so rejected fenced writes and CAS conflicts roll those rows back.
+      if (
+        Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
+        isPlainRecord(normalizedPatch.adapterConfig)
+      ) {
+        normalizedPatch.adapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
+          lockedExisting.companyId,
+          normalizedPatch.adapterConfig,
+          { adapterType: (normalizedPatch.adapterType ?? lockedExisting.adapterType) as string },
+        );
+      }
+      if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
+        // Synchronize the exact new secret references before the row UPDATE.
+        // Fenced admission triggers can then authorize controllerToken from
+        // the same-transaction binding instead of trusting a caller UUID. A
+        // rejected UPDATE rolls this binding mutation back atomically.
+        await syncAgentSecretBindings({ ...lockedExisting, ...normalizedPatch }, txDb);
+      }
       const beforeConfig = shouldRecordRevision ? buildSanitizedConfigSnapshot(lockedExisting) : null;
       // The preceding FOR UPDATE lock plus the exact persisted pre-lock
       // snapshot comparison are the CAS boundary.  Do not bind the update to
@@ -497,10 +519,6 @@ export function agentService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
-
-      if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
-        await syncAgentSecretBindings(updated, txDb);
-      }
 
       const normalizedUpdated = await agentService(txDb).getById(updated.id);
       if (!normalizedUpdated) {
@@ -611,25 +629,38 @@ export function agentService(db: Db) {
     },
 
     resume: async (id: string) => {
-      const existing = await getById(id);
-      if (!existing) return null;
-      if (existing.status === "terminated") throw conflict("Cannot resume terminated agent");
-      if (existing.status === "pending_approval") {
-        throw conflict("Pending approval agents cannot be resumed");
-      }
-
-      const updated = await db
-        .update(agents)
-        .set({
-          status: "idle",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const locked = await txDb
+          .select()
+          .from(agents)
+          .where(eq(agents.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!locked) return null;
+        if (locked.status === "terminated") throw conflict("Cannot resume terminated agent");
+        if (locked.status === "pending_approval") throw conflict("Pending approval agents cannot be resumed");
+        if (locked.status === "paused") {
+          const fence = await txDb
+            .select({ agentId: agentMaintenanceFences.agentId })
+            .from(agentMaintenanceFences)
+            .where(eq(agentMaintenanceFences.agentId, id))
+            .then((rows) => rows[0] ?? null);
+          if (fence) throw conflict("Agent maintenance fence prevents resuming this agent");
+        }
+        return txDb
+          .update(agents)
+          .set({
+            status: "idle",
+            pauseReason: null,
+            pausedAt: null,
+            errorReason: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(agents.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
       return updated ? getById(updated.id) : null;
     },
 

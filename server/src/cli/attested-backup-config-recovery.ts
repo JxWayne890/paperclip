@@ -5,6 +5,7 @@ import {
   applyAttestedBackupRecovery,
   discoverAttestedBackupRecoveryLineage,
   inspectAttestedBackupRecovery,
+  releaseAttestedBackupRecoveryFence,
   type AttestedBackupRecoveryInput,
 } from "../services/attested-backup-config-recovery.js";
 import {
@@ -12,9 +13,13 @@ import {
   type AttestedBackupEnvelope,
 } from "../services/attested-backup-config-recovery-envelope.js";
 
-type Mode = "discover" | "inspect" | "apply";
+type Mode = "discover" | "inspect" | "apply" | "release-fence";
 
-function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBackupRecoveryInput, "backupCreatedAt" | "backupAgent" | "backupLatestRevisionId" | "backupLatestRevisionCreatedAt" | "backupActivityAnchor"> } {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBackupRecoveryInput, "backupCreatedAt" | "backupAgent" | "backupGateAgent" | "backupGateLatestRevisionId" | "backupLatestRevisionId" | "backupLatestRevisionCreatedAt" | "backupActivityAnchor"> } {
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
@@ -23,7 +28,7 @@ function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBack
     values.set(key, value);
   }
   const modeValue = values.get("--mode");
-  if (modeValue !== "discover" && modeValue !== "inspect" && modeValue !== "apply") throw new Error("invalid mode");
+  if (modeValue !== "discover" && modeValue !== "inspect" && modeValue !== "apply" && modeValue !== "release-fence") throw new Error("invalid mode");
   const required = [
     "--operation-id",
     "--company-id",
@@ -31,15 +36,31 @@ function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBack
     "--expected-head-revision-id",
     "--cutover-revision-id",
     "--predecessor-revision-id",
+    "--cutover-generation",
+    "--cutover-required-patch",
     "--backup-checkpoint-id",
+    "--gate-agent-id",
   ] as const;
-  const discoveryRequired = ["--operation-id", "--company-id", "--agent-id"] as const;
-  const requiredForMode = modeValue === "discover" ? discoveryRequired : required;
+  const discoveryRequired = ["--operation-id", "--company-id", "--agent-id", "--cutover-generation", "--cutover-required-patch"] as const;
+  const releaseRequired = ["--operation-id", "--company-id", "--agent-id", "--gate-agent-id"] as const;
+  const requiredForMode = modeValue === "inspect" || modeValue === "apply"
+    ? required
+    : modeValue === "discover" ? discoveryRequired : releaseRequired;
   if (values.size !== requiredForMode.length + 1 || requiredForMode.some((key) => !values.has(key))) throw new Error("incomplete arguments");
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  const read = (key: (typeof required)[number] | (typeof discoveryRequired)[number]) => {
+  const read = (key: (typeof required)[number] | (typeof discoveryRequired)[number] | (typeof releaseRequired)[number]) => {
     const value = values.get(key)!;
     if (!uuid.test(value)) throw new Error("invalid opaque identifier");
+    return value;
+  };
+  const readGeneration = (key: "--cutover-generation") => {
+    const value = values.get(key)!;
+    if (!/^g[0-9a-f]{24}$/.test(value)) throw new Error("invalid recovery generation");
+    return value;
+  };
+  const readPatch = (key: "--cutover-required-patch") => {
+    const value = values.get(key)!;
+    if (!/^[0-9a-f]{40}$/.test(value)) throw new Error("invalid recovery patch");
     return value;
   };
   return {
@@ -48,10 +69,13 @@ function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBack
       operationId: read("--operation-id"),
       companyId: read("--company-id"),
       agentId: read("--agent-id"),
-      expectedHeadRevisionId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--expected-head-revision-id"),
-      cutoverRevisionId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--cutover-revision-id"),
-      predecessorRevisionId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--predecessor-revision-id"),
-      backupCheckpointId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--backup-checkpoint-id"),
+      expectedHeadRevisionId: modeValue === "inspect" || modeValue === "apply" ? read("--expected-head-revision-id") : "00000000-0000-4000-8000-000000000000",
+      cutoverRevisionId: modeValue === "inspect" || modeValue === "apply" ? read("--cutover-revision-id") : "00000000-0000-4000-8000-000000000000",
+      predecessorRevisionId: modeValue === "inspect" || modeValue === "apply" ? read("--predecessor-revision-id") : "00000000-0000-4000-8000-000000000000",
+      cutoverGeneration: modeValue === "release-fence" ? "g000000000000000000000000" : readGeneration("--cutover-generation"),
+      cutoverRequiredPatch: modeValue === "release-fence" ? "0000000000000000000000000000000000000000" : readPatch("--cutover-required-patch"),
+      backupCheckpointId: modeValue === "inspect" || modeValue === "apply" ? read("--backup-checkpoint-id") : "00000000-0000-4000-8000-000000000000",
+      gateAgentId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--gate-agent-id"),
     },
   };
 }
@@ -87,7 +111,16 @@ async function main() {
   if (mode === "discover") {
     try {
       const result = await discoverAttestedBackupRecoveryLineage(db, identifiers);
-      process.stdout.write(`${JSON.stringify(result)}\\n`);
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+    } finally {
+      await db.$client.end({ timeout: 5 });
+    }
+    return;
+  }
+  if (mode === "release-fence") {
+    try {
+      const result = await releaseAttestedBackupRecoveryFence(db, identifiers);
+      process.stdout.write(`${JSON.stringify(result)}\n`);
     } finally {
       await db.$client.end({ timeout: 5 });
     }
@@ -98,6 +131,7 @@ async function main() {
     envelope.operationId !== identifiers.operationId ||
     envelope.companyId !== identifiers.companyId ||
     envelope.agentId !== identifiers.agentId ||
+    !isRecord(envelope.gateAgent) || envelope.gateAgent.id !== identifiers.gateAgentId || envelope.gateAgent.companyId !== identifiers.companyId ||
     envelope.backupCheckpointId !== identifiers.backupCheckpointId
   ) {
     throw new Error("private backup envelope scope mismatch");
@@ -107,6 +141,8 @@ async function main() {
       ...identifiers,
       backupCreatedAt: envelope.backupCreatedAt,
       backupAgent: envelope.agent,
+      backupGateAgent: envelope.gateAgent,
+      backupGateLatestRevisionId: envelope.gateLatestRevisionId,
       backupLatestRevisionId: envelope.latestRevisionId,
       backupLatestRevisionCreatedAt: envelope.latestRevisionCreatedAt,
       backupActivityAnchor: envelope.activityAnchor,

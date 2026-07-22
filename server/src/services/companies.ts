@@ -5,6 +5,7 @@ import {
   companyLogos,
   assets,
   agents,
+  agentMaintenanceFences,
   agentApiKeys,
   agentRuntimeState,
   agentTaskSessions,
@@ -29,7 +30,7 @@ import {
   companySkills,
   documents,
 } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
@@ -308,6 +309,24 @@ export function companyService(db: Db) {
 
         let agentsRestored = 0;
         if (willReactivate) {
+          const pausedAgents = await tx
+            .select({ id: agents.id })
+            .from(agents)
+            .where(and(
+              eq(agents.companyId, id),
+              eq(agents.status, "paused"),
+              eq(agents.pauseReason, "company_archived"),
+            ))
+            .orderBy(agents.id)
+            .for("update");
+          if (pausedAgents.length > 0) {
+            const fenced = await tx
+              .select({ agentId: agentMaintenanceFences.agentId })
+              .from(agentMaintenanceFences)
+              .where(inArray(agentMaintenanceFences.agentId, pausedAgents.map((agent) => agent.id)))
+              .then((rows) => rows[0] ?? null);
+            if (fenced) throw conflict("Agent maintenance fence prevents company reactivation");
+          }
           const restoredRows = await tx
             .update(agents)
             .set({

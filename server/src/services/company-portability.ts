@@ -4594,11 +4594,9 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
               warnings.push(`Failed to materialize instructions bundle for ${manifestAgent.slug}: ${err instanceof Error ? err.message : String(err)}`);
             }
             agentStatusById.set(updated.id, updated.status ?? agentStatusById.get(updated.id) ?? null);
-            await secrets.syncEnvBindingsForTarget?.(
-              targetCompany.id,
-              { targetType: "agent", targetId: updated.id },
-              isPlainRecord(updated.adapterConfig) ? updated.adapterConfig.env : undefined,
-            );
+            // agents.update materializes adapter secrets and synchronizes the
+            // bindings inside its agent-locked transaction. Repeating that
+            // write after the lock releases could race an attested restore.
             importedSlugToAgentId.set(planAgent.slug, updated.id);
             existingSlugToAgentId.set(normalizeAgentUrlKey(updated.name) ?? updated.id, updated.id);
             resultAgents.push({
@@ -4635,11 +4633,8 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             warnings.push(`Failed to materialize instructions bundle for ${manifestAgent.slug}: ${err instanceof Error ? err.message : String(err)}`);
           }
           agentStatusById.set(created.id, created.status ?? createdStatus);
-          await secrets.syncEnvBindingsForTarget?.(
-            targetCompany.id,
-            { targetType: "agent", targetId: created.id },
-            isPlainRecord(created.adapterConfig) ? created.adapterConfig.env : undefined,
-          );
+          // agents.create/update already synchronize agent bindings inside
+          // their write transaction; do not issue a stale post-commit sync.
           importedSlugToAgentId.set(planAgent.slug, created.id);
           existingSlugToAgentId.set(normalizeAgentUrlKey(created.name) ?? created.id, created.id);
           resultAgents.push({

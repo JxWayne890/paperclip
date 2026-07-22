@@ -1550,12 +1550,13 @@ describe("company portability", () => {
         },
       }),
     }));
-    expect(secretSvc.syncEnvBindingsForTarget).toHaveBeenCalledWith(
+    // Agent create/update owns its binding synchronization inside the same
+    // agent transaction. Portability must not replay a stale post-commit
+    // agent binding write (project target bindings remain handled below).
+    expect(secretSvc.syncEnvBindingsForTarget).not.toHaveBeenCalledWith(
       "company-1",
       { targetType: "agent", targetId: "agent-imported" },
-      expect.objectContaining({
-        OPENAI_API_KEY: expect.objectContaining({ secretId: "secret-created" }),
-      }),
+      expect.anything(),
     );
   });
 

@@ -2,6 +2,7 @@ import { and, desc, eq, gte, inArray, lt, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  agentMaintenanceFences,
   approvals,
   budgetIncidents,
   budgetPolicies,
@@ -22,7 +23,7 @@ import type {
   BudgetThresholdType,
   BudgetWindowKind,
 } from "@paperclipai/shared";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 
 type ScopeRecord = {
@@ -261,15 +262,31 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
   async function resumeScopeFromBudget(policy: PolicyRow) {
     const now = new Date();
     if (policy.scopeType === "agent") {
-      await db
-        .update(agents)
-        .set({
-          status: "idle",
-          pauseReason: null,
-          pausedAt: null,
-          updatedAt: now,
-        })
-        .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")));
+      await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const agent = await txDb
+          .select({ companyId: agents.companyId, status: agents.status, pauseReason: agents.pauseReason })
+          .from(agents)
+          .where(eq(agents.id, policy.scopeId))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!agent || agent.status !== "paused" || agent.pauseReason !== "budget") return;
+        const fence = await txDb
+          .select({ agentId: agentMaintenanceFences.agentId })
+          .from(agentMaintenanceFences)
+          .where(eq(agentMaintenanceFences.agentId, policy.scopeId))
+          .then((rows) => rows[0] ?? null);
+        if (fence) throw conflict("Agent maintenance fence prevents budget auto-resume");
+        await txDb
+          .update(agents)
+          .set({
+            status: "idle",
+            pauseReason: null,
+            pausedAt: null,
+            updatedAt: now,
+          })
+          .where(and(eq(agents.id, policy.scopeId), eq(agents.status, "paused"), eq(agents.pauseReason, "budget")));
+      });
       return;
     }
 
