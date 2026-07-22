@@ -1169,6 +1169,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(child.pid).toBeTypeOf("number");
 
     const { runId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "idle",
       processPid: child.pid ?? null,
       includeIssue: false,
     });
@@ -1295,6 +1296,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("releases active environment leases when an orphaned run is reaped", async () => {
     const { runId, issueId, companyId } = await seedRunFixture({
+      agentStatus: "idle",
       processPid: 999_999_999,
     });
     const { leaseId } = await seedEnvironmentLeaseFixture({
@@ -2413,6 +2415,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("clears the detached warning when the run reports activity again", async () => {
     const { runId } = await seedRunFixture({
+      agentStatus: "idle",
       includeIssue: false,
       runErrorCode: "process_detached",
       runError: "Lost in-memory process handle, but child pid 123 is still alive",
