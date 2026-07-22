@@ -3,11 +3,12 @@ import { createReadStream, fstat } from "node:fs";
 import { promisify } from "node:util";
 import {
   applyAttestedBackupRecovery,
+  discoverAttestedBackupRecoveryLineage,
   inspectAttestedBackupRecovery,
   type AttestedBackupRecoveryInput,
 } from "../services/attested-backup-config-recovery.js";
 
-type Mode = "inspect" | "apply";
+type Mode = "discover" | "inspect" | "apply";
 
 type BackupEnvelope = {
   version: 1;
@@ -32,7 +33,7 @@ function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBack
     values.set(key, value);
   }
   const modeValue = values.get("--mode");
-  if (modeValue !== "inspect" && modeValue !== "apply") throw new Error("invalid mode");
+  if (modeValue !== "discover" && modeValue !== "inspect" && modeValue !== "apply") throw new Error("invalid mode");
   const required = [
     "--operation-id",
     "--company-id",
@@ -42,9 +43,11 @@ function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBack
     "--predecessor-revision-id",
     "--backup-checkpoint-id",
   ] as const;
-  if (values.size !== required.length + 1 || required.some((key) => !values.has(key))) throw new Error("incomplete arguments");
+  const discoveryRequired = ["--operation-id", "--company-id", "--agent-id"] as const;
+  const requiredForMode = modeValue === "discover" ? discoveryRequired : required;
+  if (values.size !== requiredForMode.length + 1 || requiredForMode.some((key) => !values.has(key))) throw new Error("incomplete arguments");
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  const read = (key: (typeof required)[number]) => {
+  const read = (key: (typeof required)[number] | (typeof discoveryRequired)[number]) => {
     const value = values.get(key)!;
     if (!uuid.test(value)) throw new Error("invalid opaque identifier");
     return value;
@@ -55,10 +58,10 @@ function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBack
       operationId: read("--operation-id"),
       companyId: read("--company-id"),
       agentId: read("--agent-id"),
-      expectedHeadRevisionId: read("--expected-head-revision-id"),
-      cutoverRevisionId: read("--cutover-revision-id"),
-      predecessorRevisionId: read("--predecessor-revision-id"),
-      backupCheckpointId: read("--backup-checkpoint-id"),
+      expectedHeadRevisionId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--expected-head-revision-id"),
+      cutoverRevisionId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--cutover-revision-id"),
+      predecessorRevisionId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--predecessor-revision-id"),
+      backupCheckpointId: modeValue === "discover" ? "00000000-0000-4000-8000-000000000000" : read("--backup-checkpoint-id"),
     },
   };
 }
@@ -103,6 +106,18 @@ async function main() {
     throw new Error("root-only recovery runner required");
   }
   const { mode, identifiers } = parseArgs(process.argv.slice(2));
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error("database unavailable");
+  const db = createDb(databaseUrl);
+  if (mode === "discover") {
+    try {
+      const result = await discoverAttestedBackupRecoveryLineage(db, identifiers);
+      process.stdout.write(`${JSON.stringify(result)}\\n`);
+    } finally {
+      await db.$client.end({ timeout: 5 });
+    }
+    return;
+  }
   const envelope = await readPrivateEnvelope();
   if (
     envelope.operationId !== identifiers.operationId ||
@@ -112,9 +127,6 @@ async function main() {
   ) {
     throw new Error("private backup envelope scope mismatch");
   }
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) throw new Error("database unavailable");
-  const db = createDb(databaseUrl);
   try {
     const input: AttestedBackupRecoveryInput = {
       ...identifiers,

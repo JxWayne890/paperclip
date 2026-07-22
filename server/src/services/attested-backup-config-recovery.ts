@@ -61,6 +61,16 @@ export interface AttestedBackupRecoveryResult {
   auditEventId: string | null;
 }
 
+export interface AttestedBackupRecoveryLineage {
+  status: "discoverable";
+  operationId: string;
+  companyId: string;
+  agentId: string;
+  expectedHeadRevisionId: string;
+  cutoverRevisionId: string;
+  predecessorRevisionId: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -121,6 +131,66 @@ function protectedConfigEqual(left: unknown, right: unknown): boolean {
 
 function configSnapshotEqual(left: unknown, right: unknown): boolean {
   return stableJson(left) === stableJson(right);
+}
+
+function isResearchCandidateCutover(config: unknown): boolean {
+  if (!isRecord(config) || !isRecord(config.metadata)) return false;
+  const marker = config.metadata.amcRoleControllerCutover;
+  return isRecord(marker) &&
+    marker.role === "research" &&
+    marker.state === "pending_canary" &&
+    typeof marker.generation === "string" &&
+    /^g[0-9a-f]{24}$/.test(marker.generation) &&
+    typeof marker.requiredPatch === "string" &&
+    /^[0-9a-f]{40}$/.test(marker.requiredPatch);
+}
+
+/**
+ * Discovery returns opaque revision lineage only. It deliberately evaluates
+ * only already-redacted projections; the backup is neither read nor compared
+ * here, so this cannot become a protected-value comparison oracle.
+ */
+export async function discoverAttestedBackupRecoveryLineage(
+  db: Db,
+  input: Pick<AttestedBackupRecoveryInput, "operationId" | "companyId" | "agentId">,
+): Promise<AttestedBackupRecoveryLineage> {
+  return db.transaction(async (tx) => {
+    const txDb = tx as unknown as Db;
+    const lockedAgent = await lockAgent(txDb, input as AttestedBackupRecoveryInput);
+    if (lockedAgent.status !== "paused") throw conflict("Agent must remain paused for recovery discovery");
+    await txDb.execute(sql`
+      SELECT id FROM agent_config_revisions
+      WHERE company_id = ${input.companyId} AND agent_id = ${input.agentId}
+      ORDER BY created_at, id FOR UPDATE
+    `);
+    const history = await txDb
+      .select()
+      .from(agentConfigRevisions)
+      .where(and(eq(agentConfigRevisions.companyId, input.companyId), eq(agentConfigRevisions.agentId, input.agentId)))
+      .orderBy(asc(agentConfigRevisions.createdAt), asc(agentConfigRevisions.id));
+    if (history.length < 2) throw conflict("Recovery lineage has no immediate predecessor");
+    const head = history.at(-1)!;
+    const predecessor = history.at(-2)!;
+    const matching = history.filter((revision) => isResearchCandidateCutover(revision.afterConfig));
+    if (
+      matching.length !== 1 ||
+      matching[0]!.id !== head.id ||
+      predecessor.createdAt.getTime() === head.createdAt.getTime() ||
+      !configSnapshotEqual(predecessor.afterConfig, head.beforeConfig) ||
+      !configSnapshotEqual(buildSanitizedConfigSnapshot(lockedAgent), head.afterConfig)
+    ) {
+      throw conflict("Recovery lineage is absent, ambiguous, or stale");
+    }
+    return {
+      status: "discoverable",
+      operationId: input.operationId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      expectedHeadRevisionId: head.id,
+      cutoverRevisionId: head.id,
+      predecessorRevisionId: predecessor.id,
+    };
+  });
 }
 
 function parseBackupAgent(value: unknown, input: AttestedBackupRecoveryInput): BackupAgentConfig {

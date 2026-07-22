@@ -17,6 +17,7 @@ import {
 import { buildSanitizedConfigSnapshot } from "../services/agents.ts";
 import {
   applyAttestedBackupRecovery,
+  discoverAttestedBackupRecoveryLineage,
   inspectAttestedBackupRecovery,
   type AttestedBackupRecoveryInput,
 } from "../services/attested-backup-config-recovery.ts";
@@ -78,11 +79,18 @@ describeDatabase("attested backup configuration recovery", () => {
       adapterType: "hermes_gateway",
       adapterConfig: candidateConfig,
       runtimeConfig: {},
-      metadata: null,
+      metadata: {
+        amcRoleControllerCutover: {
+          generation: "g1234567890abcdef12345678",
+          requiredPatch: "363c709e1619accc7508b9f56e1b85ec19866f68",
+          role: "research",
+          state: "pending_canary",
+        },
+      },
       updatedAt: new Date("2026-07-21T16:00:00.000Z"),
     }).returning();
     if (!live) throw new Error("seed agent missing");
-    const backupAgent = { ...live, adapterConfig: backupConfig, updatedAt: baseTime.toISOString() };
+    const backupAgent = { ...live, adapterConfig: backupConfig, metadata: null, updatedAt: baseTime.toISOString() };
     const predecessorAfter = buildSanitizedConfigSnapshot(backupAgent);
     const cutoverAfter = buildSanitizedConfigSnapshot(live);
     const predecessorId = randomUUID();
@@ -155,6 +163,29 @@ describeDatabase("attested backup configuration recovery", () => {
       status: "already_applied",
       successorRevisionId: applied.successorRevisionId,
     });
+  });
+
+  it("discovers only one opaque, redaction-safe candidate lineage", async () => {
+    const seeded = await seed();
+    await expect(discoverAttestedBackupRecoveryLineage(db, {
+      operationId: seeded.input.operationId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+    })).resolves.toEqual({
+      status: "discoverable",
+      operationId: seeded.input.operationId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      expectedHeadRevisionId: seeded.cutoverId,
+      cutoverRevisionId: seeded.cutoverId,
+      predecessorRevisionId: seeded.predecessorId,
+    });
+    await db.update(agents).set({ metadata: null }).where(eq(agents.id, seeded.agentId));
+    await expect(discoverAttestedBackupRecoveryLineage(db, {
+      operationId: seeded.input.operationId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+    })).rejects.toThrow(/lineage/i);
   });
 
   it("rejects a changed protected value, a stale head, and an ambiguous predecessor", async () => {
