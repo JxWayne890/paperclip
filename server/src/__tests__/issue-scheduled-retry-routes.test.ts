@@ -305,7 +305,8 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
   });
 
   it("uses normal promotion gates and records gate-suppressed retries", async () => {
-    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({ agentStatus: "paused" });
+    const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
 
     const res = await request(createApp(boardActor(companyId)))
       .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
