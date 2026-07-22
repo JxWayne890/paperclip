@@ -1,5 +1,4 @@
 import { createDb } from "@paperclipai/db";
-import { createHmac, timingSafeEqual } from "node:crypto";
 import { createReadStream, fstat } from "node:fs";
 import { promisify } from "node:util";
 import {
@@ -8,28 +7,12 @@ import {
   inspectAttestedBackupRecovery,
   type AttestedBackupRecoveryInput,
 } from "../services/attested-backup-config-recovery.js";
+import {
+  verifySignedAttestedBackupEnvelope,
+  type AttestedBackupEnvelope,
+} from "../services/attested-backup-config-recovery-envelope.js";
 
 type Mode = "discover" | "inspect" | "apply";
-
-type BackupEnvelope = {
-  version: 1;
-  operationId: string;
-  companyId: string;
-  agentId: string;
-  backupCheckpointId: string;
-  verifiedBackupSha256: string;
-  backupCreatedAt: string;
-  latestRevisionId: string;
-  latestRevisionCreatedAt: string;
-  activityAnchor: { id: string; createdAt: string } | null;
-  agent: unknown;
-};
-
-type SignedBackupEnvelope = {
-  version: 1;
-  mac: string;
-  payloadBase64: string;
-};
 
 function parseArgs(argv: string[]): { mode: Mode; identifiers: Omit<AttestedBackupRecoveryInput, "backupCreatedAt" | "backupAgent" | "backupLatestRevisionId" | "backupLatestRevisionCreatedAt" | "backupActivityAnchor"> } {
   const values = new Map<string, string>();
@@ -80,7 +63,7 @@ const fstatAsync = promisify(fstat);
  * creates it as a one-shot pipe after verifying and querying the backup. The
  * CLI never reads stdin, a path, environment payload, or a regular file.
  */
-async function readPrivateEnvelope(): Promise<BackupEnvelope> {
+async function readPrivateEnvelope(): Promise<AttestedBackupEnvelope> {
   const descriptor = 3;
   const stat = await fstatAsync(descriptor).catch(() => null);
   if (!stat?.isFIFO() || process.stdin.isTTY) throw new Error("private recovery pipe required");
@@ -88,46 +71,9 @@ async function readPrivateEnvelope(): Promise<BackupEnvelope> {
   const privatePipe = createReadStream("/dev/null", { fd: descriptor, autoClose: false });
   for await (const chunk of privatePipe) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   const raw = Buffer.concat(chunks);
-  if (raw.length === 0 || raw.length > 24 * 1024 * 1024) throw new Error("invalid backup input");
-  const signed = JSON.parse(raw.toString("utf8")) as Partial<SignedBackupEnvelope>;
-  if (
-    signed.version !== 1 ||
-    typeof signed.mac !== "string" ||
-    !/^[0-9a-f]{64}$/i.test(signed.mac) ||
-    typeof signed.payloadBase64 !== "string" ||
-    !/^[A-Za-z0-9+/]+={0,2}$/.test(signed.payloadBase64)
-  ) {
-    throw new Error("invalid signed backup envelope");
-  }
-  const payload = Buffer.from(signed.payloadBase64, "base64");
-  if (payload.length === 0 || payload.length > 16 * 1024 * 1024) throw new Error("invalid backup payload");
   const signingSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
   if (!signingSecret) throw new Error("server signing secret unavailable");
-  const expectedMac = createHmac("sha256", signingSecret)
-    .update("paperclip-attested-backup-recovery/private-pipe/v1|")
-    .update(payload)
-    .digest();
-  const suppliedMac = Buffer.from(signed.mac, "hex");
-  if (suppliedMac.length !== expectedMac.length || !timingSafeEqual(suppliedMac, expectedMac)) {
-    throw new Error("private backup envelope authentication failed");
-  }
-  const value = JSON.parse(payload.toString("utf8")) as Partial<BackupEnvelope>;
-  if (
-    value.version !== 1 ||
-    typeof value.operationId !== "string" ||
-    typeof value.companyId !== "string" ||
-    typeof value.agentId !== "string" ||
-    typeof value.backupCheckpointId !== "string" ||
-    !/^[0-9a-f]{64}$/i.test(value.verifiedBackupSha256 ?? "") ||
-    typeof value.backupCreatedAt !== "string" ||
-    typeof value.latestRevisionId !== "string" ||
-    typeof value.latestRevisionCreatedAt !== "string" ||
-    !(value.activityAnchor === null || (typeof value.activityAnchor?.id === "string" && typeof value.activityAnchor?.createdAt === "string")) ||
-    value.agent === undefined
-  ) {
-    throw new Error("invalid backup envelope");
-  }
-  return value as BackupEnvelope;
+  return verifySignedAttestedBackupEnvelope(raw, signingSecret);
 }
 
 async function main() {
