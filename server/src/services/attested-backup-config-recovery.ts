@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -95,11 +96,16 @@ function stableJson(value: unknown): string {
 function constantTimeEqual(left: string, right: string): boolean {
   const leftBytes = Buffer.from(left, "utf8");
   const rightBytes = Buffer.from(right, "utf8");
-  let different = leftBytes.length ^ rightBytes.length;
   const length = Math.max(leftBytes.length, rightBytes.length);
-  for (let index = 0; index < length; index += 1) {
-    different |= (leftBytes[index] ?? 0) ^ (rightBytes[index] ?? 0);
-  }
+  const paddedLeft = Buffer.alloc(length);
+  const paddedRight = Buffer.alloc(length);
+  leftBytes.copy(paddedLeft);
+  rightBytes.copy(paddedRight);
+  // Compare equal-size buffers first so a length mismatch cannot bypass the
+  // timing-safe primitive. The final length bit is folded into the result
+  // only after that comparison has completed.
+  let different = timingSafeEqual(paddedLeft, paddedRight) ? 0 : 1;
+  different |= leftBytes.length ^ rightBytes.length;
   return different === 0;
 }
 
