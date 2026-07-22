@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
@@ -22,6 +22,35 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService, resolveHeartbeatSchedulingSuppression } from "../services/heartbeat.ts";
+
+const adapterExecute = vi.hoisted(() =>
+  vi.fn(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    return {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      summary: "Completed assigned work.",
+      provider: "test",
+      model: "test-model",
+    };
+  }),
+);
+
+vi.mock("../adapters/index.js", () => ({
+  getServerAdapter: () => ({
+    type: "process",
+    execute: adapterExecute,
+    supportsLocalAgentJwt: false,
+  }),
+  findActiveServerAdapter: () => ({
+    type: "process",
+    execute: adapterExecute,
+    supportsLocalAgentJwt: false,
+  }),
+  listAdapterModelProfiles: async () => [],
+  runningProcesses: new Map(),
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -82,10 +111,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       role: "engineer",
       status: "idle",
       adapterType: "process",
-      adapterConfig: {
-        command: process.execPath,
-        args: ["-e", "process.exit(0)"],
-      },
+      adapterConfig: {},
       runtimeConfig: {
         heartbeat: {
           enabled: true,
@@ -132,6 +158,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       if (state?.lastRunId === runId) return;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
+    throw new Error(`Agent ${agentId} did not record heartbeat run ${runId}.`);
   }
 
   it("suppresses new assignment wakes in worktree instances without creating heartbeat runs", async () => {
@@ -228,20 +255,19 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     });
 
     expect(run).not.toBeNull();
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: new Date() })
+      .where(eq(issues.id, issueId));
     const terminalStatus = await waitForTerminalRun(run!.id);
-    expect(["succeeded", null]).toContain(terminalStatus);
+    expect(terminalStatus).toBe("succeeded");
+    await waitForRuntimeStateLastRun(agentId, run!.id);
 
     const runCount = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(heartbeatRuns)
       .then((rows) => rows[0]?.count ?? 0);
     expect(runCount).toBe(1);
-
-    await db
-      .update(issues)
-      .set({ status: "done", updatedAt: new Date() })
-      .where(eq(issues.id, issueId));
-    await waitForRuntimeStateLastRun(agentId, run!.id);
   });
 
   it("recognizes explicit restore-in-progress suppression", () => {
