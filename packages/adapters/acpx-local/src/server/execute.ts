@@ -182,27 +182,40 @@ async function writeFileAtomically(input: {
 
 async function ensureSymlink(target: string, source: string): Promise<void> {
   const resolvedSource = path.resolve(source);
-  const existing = await fs.lstat(target).catch(() => null);
-  if (!existing) {
-    await ensureParentDir(target);
-    await fs.symlink(resolvedSource, target);
-    return;
+  // Several ACPX runs for one company can initialize the managed Codex home
+  // concurrently. Treat the lstat/symlink gap as an expected race and
+  // re-read the winner instead of failing one otherwise equivalent run with
+  // EEXIST. Mismatched or non-link targets are still replaced deliberately.
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const existing = await fs.lstat(target).catch(() => null);
+    if (!existing) {
+      await ensureParentDir(target);
+      try {
+        await fs.symlink(resolvedSource, target);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+        throw error;
+      }
+    }
+
+    if (!existing.isSymbolicLink()) {
+      await fs.rm(target, { recursive: true, force: true });
+      continue;
+    }
+
+    const linkedPath = await fs.readlink(target).catch(() => null);
+    if (!linkedPath) continue;
+
+    const resolvedLinkedPath = path.resolve(path.dirname(target), linkedPath);
+    if (resolvedLinkedPath === resolvedSource) return;
+
+    await fs.unlink(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
   }
 
-  if (!existing.isSymbolicLink()) {
-    await fs.rm(target, { recursive: true, force: true });
-    await fs.symlink(resolvedSource, target);
-    return;
-  }
-
-  const linkedPath = await fs.readlink(target).catch(() => null);
-  if (!linkedPath) return;
-
-  const resolvedLinkedPath = path.resolve(path.dirname(target), linkedPath);
-  if (resolvedLinkedPath === resolvedSource) return;
-
-  await fs.unlink(target);
-  await fs.symlink(resolvedSource, target);
+  throw new Error("Unable to establish the managed Codex authentication link after concurrent changes.");
 }
 
 async function ensureCopiedFile(target: string, source: string): Promise<void> {
